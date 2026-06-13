@@ -106,10 +106,37 @@ struct IngredientShard<C: Configuration> {
     ///
     /// This doesn't hold the fields themselves to save memory, instead it points
     /// to the slot ID.
-    key_map: hashbrown::HashTable<Id>,
+    key_map: hashbrown::HashTable<InternedId>,
 
     /// An intrusive linked list for LRU.
     lru: LinkedList<ValueAdapter<C>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InternedId {
+    id: Id,
+    hash: CachedHash,
+}
+
+const _: [(); std::mem::size_of::<InternedId>()] = [(); 12];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CachedHash(u32);
+
+impl CachedHash {
+    /// Fold the hash to keep each map entry to 12 bytes instead of 16.
+    ///
+    /// Collisions only cause additional equality checks; the fields remain the authority for
+    /// whether two interned values are equal.
+    fn new(hash: u64) -> Self {
+        Self((hash as u32) ^ (hash >> 32) as u32)
+    }
+
+    /// Expand the cached bits across both halves so hashbrown gets entropy for both its bucket
+    /// index and control byte.
+    fn table_hash(self) -> u64 {
+        u64::from(self.0) | (u64::from(self.0) << 32)
+    }
 }
 
 impl<C: Configuration> Default for IngredientShard<C> {
@@ -364,18 +391,20 @@ where
         self.revision_queue.record(current_revision);
 
         // Hash the value before acquiring the lock.
-        let hash = self.hasher.hash_one(&key);
+        let hash = CachedHash::new(self.hasher.hash_one(&key));
+        let table_hash = hash.table_hash();
 
-        let shard_index = self.shard(hash);
+        let shard_index = self.shard(table_hash);
         // SAFETY: `shard_index` is guaranteed to be in-bounds for `self.shards`.
         let shard = unsafe { &mut *self.shards.get_unchecked(shard_index).lock() };
 
         let found_value = Cell::new(None);
         // SAFETY: We hold the lock for the shard containing the value.
-        let eq = |id: &_| unsafe { Self::value_eq(*id, &key, zalsa, &found_value) };
+        let eq =
+            |entry: &InternedId| unsafe { Self::value_eq(entry.id, &key, zalsa, &found_value) };
 
         // Attempt a fast-path lookup of already interned data.
-        if let Some(&id) = shard.key_map.find(hash, eq) {
+        if let Some(&InternedId { id, .. }) = shard.key_map.find(table_hash, eq) {
             let value = found_value
                 .get()
                 .expect("found the interned value, so `found_value` should be set");
@@ -536,10 +565,12 @@ where
             // map. Crucially, we know that the hashes for the old and new fields both map
             // to the same shard, because we determined the initial shard based on the new
             // fields and only accessed the LRU list for that shard.
-            let old_hash = self.hasher.hash_one(&*old_fields);
+            let old_hash = CachedHash::new(self.hasher.hash_one(&*old_fields));
             shard
                 .key_map
-                .find_entry(old_hash, |found_id: &Id| *found_id == old_id)
+                .find_entry(old_hash.table_hash(), |entry: &InternedId| {
+                    entry.id == old_id
+                })
                 .expect("interned value in LRU so must be in key_map")
                 .remove();
 
@@ -548,11 +579,12 @@ where
             // SAFETY: We call `from_internal_data` to restore the correct lifetime before access.
             *old_fields = unsafe { self.to_internal_data(assemble(new_id, key)) };
 
-            // SAFETY: We hold the lock for the shard containing the value.
-            let hasher = |id: &_| unsafe { self.value_hash(*id, zalsa) };
-
             // Insert the new value into the ID map.
-            shard.key_map.insert_unique(hash, new_id, hasher);
+            shard
+                .key_map
+                .insert_unique(table_hash, InternedId { id: new_id, hash }, |entry| {
+                    entry.hash.table_hash()
+                });
 
             // SAFETY: We hold the lock for the shard containing the value, and the
             // value has not been interned in the current revision, so no references to
@@ -592,7 +624,7 @@ where
         assemble: impl FnOnce(Id, Key) -> C::Fields<'db>,
         shard: &mut IngredientShard<C>,
         shard_index: usize,
-        hash: u64,
+        hash: CachedHash,
     ) -> crate::Id
     where
         Key: Hash,
@@ -655,7 +687,7 @@ where
         id: Id,
         zalsa: &Zalsa,
         shard: &mut IngredientShard<C>,
-        hash: u64,
+        hash: CachedHash,
         value: &Value<C>,
     ) {
         // SAFETY: We hold the lock for the shard containing the value.
@@ -669,17 +701,18 @@ where
             shard.lru.push_front(unsafe { UnsafeRef::from_raw(value) });
         }
 
-        // SAFETY: We hold the lock for the shard containing the value.
-        let hasher = |id: &_| unsafe { self.value_hash(*id, zalsa) };
-
         // Insert the value into the ID map.
-        shard.key_map.insert_unique(hash, id, hasher);
+        shard
+            .key_map
+            .insert_unique(hash.table_hash(), InternedId { id, hash }, |entry| {
+                entry.hash.table_hash()
+            });
 
         debug_assert_eq!(hash, {
             let value = zalsa.table().get::<Value<C>>(id);
 
             // SAFETY: We hold the lock for the shard containing the value.
-            unsafe { self.hasher.hash_one(&*value.fields.get()) }
+            unsafe { CachedHash::new(self.hasher.hash_one(&*value.fields.get())) }
         });
     }
 
@@ -725,20 +758,6 @@ where
 
         // Reset the table after having dropped any memos.
         memo_table.reset();
-    }
-
-    // Hashes the value by its fields.
-    //
-    // # Safety
-    //
-    // The lock must be held for the shard containing the value.
-    unsafe fn value_hash<'db>(&'db self, id: Id, zalsa: &'db Zalsa) -> u64 {
-        // This closure is only called if the table is resized. So while it's expensive
-        // to lookup all values, it will only happen rarely.
-        let value = zalsa.table().get::<Value<C>>(id);
-
-        // SAFETY: We hold the lock for the shard containing the value.
-        unsafe { self.hasher.hash_one(&*value.fields.get()) }
     }
 
     // Compares the value by its fields to the given key.
@@ -1480,7 +1499,7 @@ mod persistence {
     use serde::ser::{SerializeMap, SerializeStruct};
     use serde::{Deserialize, de};
 
-    use super::{Configuration, IngredientImpl, Value, ValueShared};
+    use super::{CachedHash, Configuration, IngredientImpl, Value, ValueShared};
     use crate::plumbing::Ingredient;
     use crate::table::memo::MemoTable;
     use crate::zalsa::Zalsa;
@@ -1619,8 +1638,8 @@ mod persistence {
                 let (page_idx, _) = crate::table::split_id(id);
 
                 // Determine the value shard.
-                let hash = ingredient.hasher.hash_one(&value.fields.0);
-                let shard_index = ingredient.shard(hash);
+                let hash = CachedHash::new(ingredient.hasher.hash_one(&value.fields.0));
+                let shard_index = ingredient.shard(hash.table_hash());
 
                 // SAFETY: `shard_index` is guaranteed to be in-bounds for `self.shards`.
                 let shard = unsafe { &mut *ingredient.shards.get_unchecked(shard_index).lock() };

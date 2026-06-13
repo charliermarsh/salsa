@@ -4,7 +4,9 @@
 //! compiles and executes successfully.
 
 use std::borrow::Cow;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use expect_test::expect;
 use salsa::plumbing::{AsId, FromId};
@@ -57,6 +59,23 @@ struct Foo;
 #[salsa::interned(debug)]
 struct InternedFoo<'db> {
     data: Foo,
+}
+
+static HASH_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Debug, Eq, PartialEq, salsa::Update)]
+struct CountingHash(usize);
+
+impl Hash for CountingHash {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        HASH_CALLS.fetch_add(1, Ordering::Relaxed);
+        state.write_usize(0);
+    }
+}
+
+#[salsa::interned]
+struct InternedCountingHash<'db> {
+    data: CountingHash,
 }
 
 #[derive(Clone, Copy, Hash, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -118,6 +137,25 @@ fn interning_returns_equal_keys_for_equal_data() {
     let s2_2 = InternedString::new(&db, "World, ");
     assert_eq!(s1, s1_2);
     assert_eq!(s2, s2_2);
+}
+
+#[test]
+fn resizing_interned_map_does_not_rehash_fields() {
+    let db = salsa::DatabaseImpl::new();
+    const ENTRIES: usize = 512;
+
+    HASH_CALLS.store(0, Ordering::Relaxed);
+    for index in 0..ENTRIES {
+        InternedCountingHash::new(&db, CountingHash(index));
+    }
+
+    let expected = if cfg!(debug_assertions) {
+        // `insert_id` verifies that the assembled fields match the key's hash in debug builds.
+        ENTRIES * 2
+    } else {
+        ENTRIES
+    };
+    assert_eq!(HASH_CALLS.load(Ordering::Relaxed), expected);
 }
 #[test]
 fn interning_returns_equal_keys_for_equal_data_multi_field() {
