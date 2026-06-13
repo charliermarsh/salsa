@@ -14,10 +14,16 @@ use crate::{Id, IngredientIndex};
 
 pub(crate) type SyncGuard<'me> = crate::sync::MutexGuard<'me, FxHashMap<Id, SyncState>>;
 
+// This is deliberately fixed rather than scaling with the core count: 32 shards
+// remove observed contention while keeping the per-ingredient overhead bounded.
+const SHARD_COUNT: usize = 32;
+const SHARD_HASH_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
+const _: () = assert!(SHARD_COUNT.is_power_of_two());
+
 /// Tracks the keys that are currently being processed; used to coordinate between
 /// worker threads.
 pub(crate) struct SyncTable {
-    syncs: Mutex<FxHashMap<Id, SyncState>>,
+    syncs: [Mutex<FxHashMap<Id, SyncState>>; SHARD_COUNT],
     ingredient: IngredientIndex,
 }
 
@@ -60,9 +66,22 @@ pub(crate) struct SyncState {
 impl SyncTable {
     pub(crate) fn new(ingredient: IngredientIndex) -> Self {
         Self {
-            syncs: Default::default(),
+            syncs: std::array::from_fn(|_| Default::default()),
             ingredient,
         }
+    }
+
+    #[inline]
+    fn syncs_for(&self, key_index: Id) -> &Mutex<FxHashMap<Id, SyncState>> {
+        &self.syncs[Self::shard_index(key_index)]
+    }
+
+    #[inline]
+    fn shard_index(key_index: Id) -> usize {
+        // Fibonacci hashing spreads sequential slots and keys at the same slot offset
+        // on different pages across the power-of-two shard count.
+        let hash = key_index.as_bits().wrapping_mul(SHARD_HASH_MULTIPLIER);
+        (hash >> (u64::BITS - SHARD_COUNT.ilog2())) as usize
     }
 
     /// Claims the given key index, or blocks if it is running on another thread.
@@ -73,7 +92,7 @@ impl SyncTable {
         key_index: Id,
         reentrant: Reentrancy,
     ) -> ClaimResult<'me> {
-        let mut write = self.syncs.lock();
+        let mut write = self.syncs_for(key_index).lock();
         match write.entry(key_index) {
             std::collections::hash_map::Entry::Occupied(occupied_entry) => {
                 let id = match occupied_entry.get().id {
@@ -137,7 +156,7 @@ impl SyncTable {
         key_index: Id,
         reentrant: Reentrancy,
     ) -> ClaimResult<'me, ()> {
-        let mut write = self.syncs.lock();
+        let mut write = self.syncs_for(key_index).lock();
         match write.entry(key_index) {
             std::collections::hash_map::Entry::Occupied(occupied_entry) => {
                 let id = match occupied_entry.get().id {
@@ -267,7 +286,7 @@ impl SyncTable {
     /// Note: The result of this method will immediately become stale unless the thread owning `key_index`
     /// is currently blocked on this thread (claiming `key_index` from this thread results in a cycle).
     pub(super) fn mark_as_transfer_target(&self, key_index: Id) -> Option<SyncOwner> {
-        let mut syncs = self.syncs.lock();
+        let mut syncs = self.syncs_for(key_index).lock();
         syncs.get_mut(&key_index).map(|state| {
             // We set `anyone_waiting` to true because it is used in `ClaimGuard::release`
             // to exit early if the query doesn't need to release any locks.
@@ -329,7 +348,7 @@ impl<'me> ClaimGuard<'me> {
     #[cold]
     #[inline(never)]
     fn release_panicking(&self) {
-        let mut syncs = self.sync_table.syncs.lock();
+        let mut syncs = self.sync_table.syncs_for(self.key_index).lock();
         let state = syncs.remove(&self.key_index).expect("key claimed twice?");
         let result = if self.zalsa_local.should_trigger_local_cancellation() {
             WaitResult::Cancelled
@@ -374,7 +393,7 @@ impl<'me> ClaimGuard<'me> {
     #[cold]
     #[inline(never)]
     fn release_self(&self) {
-        let mut syncs = self.sync_table.syncs.lock();
+        let mut syncs = self.sync_table.syncs_for(self.key_index).lock();
         let std::collections::hash_map::Entry::Occupied(mut state) = syncs.entry(self.key_index)
         else {
             panic!("key should only be claimed/released once");
@@ -401,7 +420,7 @@ impl<'me> ClaimGuard<'me> {
         else {
             self.release(
                 self.sync_table
-                    .syncs
+                    .syncs_for(self.key_index)
                     .lock()
                     .remove(&self.key_index)
                     .expect("key should only be claimed/released once"),
@@ -411,7 +430,7 @@ impl<'me> ClaimGuard<'me> {
             panic!("new owner to be a locked query")
         };
 
-        let mut syncs = self.sync_table.syncs.lock();
+        let mut syncs = self.sync_table.syncs_for(self.key_index).lock();
 
         let self_key = self.database_key_index();
         tracing::debug!(
@@ -447,7 +466,7 @@ impl<'me> ClaimGuard<'me> {
     fn drop_impl(&mut self) -> bool {
         match self.mode {
             ReleaseMode::Default => {
-                let mut syncs = self.sync_table.syncs.lock();
+                let mut syncs = self.sync_table.syncs_for(self.key_index).lock();
                 let state = syncs
                     .remove(&self.key_index)
                     .expect("key should only be claimed/released once");
@@ -514,6 +533,28 @@ impl std::fmt::Debug for ClaimGuard<'_> {
             .field("key_index", &self.key_index)
             .field("mode", &self.mode)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SyncTable;
+    use crate::Id;
+
+    #[test]
+    fn shard_index_uses_the_full_id() {
+        // SAFETY: These indexes are less than `Id::MAX_U32`.
+        let (first_page, second_page) = unsafe { (Id::from_index(0), Id::from_index(1024)) };
+        let next_generation = first_page.with_generation(1);
+
+        assert_ne!(
+            SyncTable::shard_index(first_page),
+            SyncTable::shard_index(second_page)
+        );
+        assert_ne!(
+            SyncTable::shard_index(first_page),
+            SyncTable::shard_index(next_generation)
+        );
     }
 }
 
