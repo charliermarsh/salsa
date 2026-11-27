@@ -37,6 +37,12 @@ use crate::{Cancelled, Id, Revision};
 /// **Note also that all mutations to the database handle (and hence
 /// to the local-state) must be undone during unwinding.**
 pub struct ZalsaLocal {
+    /// The final revision, copied when a worker borrows the frozen database.
+    pub(crate) frozen: Option<Revision>,
+
+    /// A bounded cache that is allocated only on the first intern after freezing.
+    recent: std::cell::OnceCell<Box<[RecentIntern]>>,
+
     /// Vector of active queries.
     ///
     /// Unwinding note: pushes onto this vector must be popped -- even
@@ -87,9 +93,40 @@ impl CancellationToken {
     }
 }
 
+type RecentIntern = std::cell::Cell<Option<(u64, DatabaseKeyIndex)>>;
+
 impl ZalsaLocal {
+    /// Returns the final revision if future input updates are disabled.
+    #[inline]
+    pub(crate) fn frozen_revision(&self) -> Option<Revision> {
+        if cfg!(feature = "persistence") {
+            None
+        } else {
+            self.frozen
+        }
+    }
+
+    /// Selects a candidate for a repeated lookup. The caller must check both
+    /// the ingredient and the key before reusing the cached ID.
+    #[inline]
+    pub(crate) fn recent_intern(&self, hash: u64, ingredient: IngredientIndex) -> &RecentIntern {
+        const LEN: usize = 2048;
+        let values = self
+            .recent
+            .get_or_init(|| vec![RecentIntern::new(None); LEN].into_boxed_slice());
+        let i = (hash >> 32) as usize ^ (ingredient.as_u32() as usize);
+        &values[i & (LEN - 1)]
+    }
+
     pub(crate) fn new() -> Self {
+        Self::new_for(None)
+    }
+
+    /// Creates local state for a handle to the shared database.
+    pub(crate) fn new_for(frozen: Option<Revision>) -> Self {
         ZalsaLocal {
+            frozen,
+            recent: Default::default(),
             query_stack: RefCell::new(QueryStack::default()),
             most_recent_pages: UnsafeCell::new(FxHashMap::default()),
             cancelled: CancellationToken::default(),
@@ -184,6 +221,14 @@ impl ZalsaLocal {
     pub(crate) fn push_query(&self, database_key_index: DatabaseKeyIndex) -> ActiveQueryGuard<'_> {
         self.with_query_stack_mut(|stack| {
             stack.push_new_query(database_key_index);
+            // Older memos can still need verification against the frozen revision.
+            // Give newly computed values a conservative stamp even if reads are elided.
+            if let Some(revision) = self.frozen_revision() {
+                stack
+                    .last_mut()
+                    .expect("just pushed a query")
+                    .add_changed_at(revision);
+            }
 
             ActiveQueryGuard {
                 local_state: self,
@@ -328,6 +373,14 @@ impl ZalsaLocal {
             changed_at
         );
 
+        if self.frozen_revision().is_some() && cycle_heads.is_empty() {
+            #[cfg(feature = "accumulator")]
+            if !has_accumulated && !accumulated_inputs.load().is_any() {
+                return;
+            }
+            #[cfg(not(feature = "accumulator"))]
+            return;
+        }
         self.with_active_query_mut(|query| {
             query.add_read(
                 input,
@@ -357,6 +410,9 @@ impl ZalsaLocal {
             changed_at
         );
 
+        if self.frozen_revision().is_some() {
+            return;
+        }
         self.with_active_query_mut(|query| {
             query.add_read_simple(input, durability, changed_at);
         });
@@ -364,6 +420,9 @@ impl ZalsaLocal {
 
     /// Update the active query's changed revision and return its durability.
     pub(crate) fn report_tracked_read_revision(&self, changed_at: Revision) -> Option<Durability> {
+        if self.frozen_revision().is_some() {
+            return Some(Durability::MAX);
+        }
         self.with_active_query_mut(|query| {
             query.add_changed_at(changed_at);
             query.stamp().durability
@@ -378,6 +437,22 @@ impl ZalsaLocal {
     #[inline(always)]
     pub(crate) fn report_untracked_read(&self, current_revision: Revision) {
         self.with_active_query_mut(|query| query.add_untracked_read(current_revision));
+    }
+
+    /// Return the current stamp if the query has no IDs to reuse.
+    pub(crate) fn deferred_stamp(&self) -> Option<Stamp> {
+        let stack = self.query_stack.borrow();
+        let query = stack.last()?;
+        query
+            .tracked_struct_ids()
+            .can_defer()
+            .then(|| query.stamp())
+    }
+
+    /// Remembers creation order so a cycle can reconstruct the same identities.
+    pub(crate) fn defer_tracked_struct_id(&self, key: IdentityHash, id: Id) {
+        self.with_active_query_mut(|query| query.tracked_struct_ids_mut().defer(key, id))
+            .expect("cannot store a tracked struct ID outside of a tracked function");
     }
 
     /// Assign the new tracked struct an identity and look for an ID from the previous execution.
@@ -1889,7 +1964,7 @@ impl<'me> ActiveQueryGuard<'me> {
         self.local_state.with_query_stack_mut(|stack| {
             #[cfg(debug_assertions)]
             assert_eq!(stack.len(), self.push_len, "mismatched push and pop");
-            f(stack.last_mut().unwrap())
+            f(stack.last_mut().expect("just pushed a query"))
         })
     }
 

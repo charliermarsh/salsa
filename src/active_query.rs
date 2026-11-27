@@ -244,6 +244,13 @@ impl ActiveQuery {
             accumulated_inputs,
         } = self;
 
+        // A final memo in the frozen revision cannot be invalidated. Cycle participants
+        // still need their identities for the next iteration. Detached completion has
+        // already taken the cycle heads out of the frame and sets `force_extra`.
+        tracked_struct_ids.resolve_deferred(
+            disambiguator_map,
+            force_extra || !cycle_heads.is_empty() || !iteration.is_default(),
+        );
         disambiguator_map.clear();
 
         #[cfg(feature = "accumulator")]
