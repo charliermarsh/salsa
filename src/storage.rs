@@ -61,8 +61,8 @@ impl<Db: Database> StorageHandle<Db> {
 
     pub fn into_storage(self) -> Storage<Db> {
         Storage {
+            zalsa_local: ZalsaLocal::new_for(self.zalsa_impl.frozen),
             handle: self,
-            zalsa_local: ZalsaLocal::new(),
         }
     }
 }
@@ -120,6 +120,35 @@ impl<Db: Database> Storage<Db> {
             handle: StorageHandle::new(event_callback),
             zalsa_local: ZalsaLocal::new(),
         }
+    }
+
+    /// Permanently freezes the current revision for a one-shot computation.
+    ///
+    /// Once frozen, queries can omit dependencies used only to validate later revisions.
+    /// Call this after applying the last input update and before cloning worker handles.
+    ///
+    /// Frozen databases can still create inputs, execute queries, and cancel work.
+    /// Returns false if persistence is enabled or another handle exists and
+    /// the database is still mutable. Drop outstanding handles before retrying.
+    ///
+    /// After a successful freeze, input setters, synthetic writes and explicit
+    /// LRU eviction panic. Database-wide cancellation can also panic if it
+    /// exhausts the remaining cancellation epochs and needs a new revision.
+    #[must_use]
+    pub fn try_freeze(&mut self) -> bool {
+        // Persistence requires a complete dependency graph and can restore a revision.
+        if cfg!(feature = "persistence") {
+            return false;
+        }
+        if self.zalsa_local.frozen.is_some() {
+            return true;
+        }
+        let Some(zalsa) = Arc::get_mut(&mut self.handle.zalsa_impl) else {
+            return false;
+        };
+        zalsa.frozen = Some(zalsa.current_revision());
+        self.zalsa_local.frozen = zalsa.frozen;
+        true
     }
 
     /// Returns a builder for database storage.
@@ -260,7 +289,7 @@ impl<Db: Database> Clone for Storage<Db> {
     fn clone(&self) -> Self {
         Self {
             handle: self.handle.clone(),
-            zalsa_local: ZalsaLocal::new(),
+            zalsa_local: ZalsaLocal::new_for(self.handle.zalsa_impl.frozen),
         }
     }
 }

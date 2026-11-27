@@ -142,6 +142,7 @@ impl MemoIngredientIndex {
 ///
 /// **NOT SEMVER STABLE.**
 pub struct Zalsa {
+    pub(crate) frozen: Option<Revision>,
     views_of: Views,
 
     #[cfg(not(feature = "inventory"))]
@@ -186,6 +187,7 @@ impl Zalsa {
         jars: Vec<ErasedJar>,
     ) -> Self {
         let mut zalsa = Self {
+            frozen: None,
             views_of: Views::new::<Db>(),
             jar_map: HashMap::default(),
             ingredient_to_id_struct_type_id_map: Default::default(),
@@ -407,12 +409,17 @@ impl Zalsa {
             .insert(index, (jar.id_struct_type_id)());
     }
 
+    fn assert_mutable(&self) {
+        assert!(self.frozen.is_none(), "database has been frozen");
+    }
+
     /// **NOT SEMVER STABLE**
     #[doc(hidden)]
     pub fn lookup_ingredient_mut(
         &mut self,
         index: IngredientIndex,
     ) -> (&mut dyn Ingredient, &mut Runtime) {
+        self.assert_mutable();
         let index = index.as_u32() as usize;
         let ingredient = self
             .ingredients_vec
@@ -424,12 +431,14 @@ impl Zalsa {
     /// **NOT SEMVER STABLE**
     #[doc(hidden)]
     pub fn take_ingredient(&mut self, index: IngredientIndex) -> Box<dyn Ingredient> {
+        self.assert_mutable();
         self.ingredients_vec.remove(index.as_u32() as usize)
     }
 
     /// **NOT SEMVER STABLE**
     #[doc(hidden)]
     pub fn replace_ingredient(&mut self, index: IngredientIndex, ingredient: Box<dyn Ingredient>) {
+        self.assert_mutable();
         self.ingredients_vec
             .insert(index.as_u32() as usize, ingredient);
     }
@@ -452,6 +461,10 @@ impl Zalsa {
     /// Triggers a new revision.
     #[doc(hidden)]
     pub fn new_revision(&mut self) -> Revision {
+        assert!(
+            self.frozen.is_none(),
+            "cannot start a new revision after freezing"
+        );
         let new_revision = self.runtime.new_revision();
         #[cfg(feature = "detailed-trace")]
         let _span = crate::tracing::debug_span!("new_revision", ?new_revision).entered();
@@ -467,6 +480,7 @@ impl Zalsa {
     /// **NOT SEMVER STABLE**
     #[doc(hidden)]
     pub fn evict_lru(&mut self) {
+        assert!(self.frozen.is_none(), "cannot evict values after freezing");
         #[cfg(feature = "detailed-trace")]
         let _span = crate::tracing::debug_span!("evict_lru").entered();
         for ingredient in &self.ingredients_requiring_reset {

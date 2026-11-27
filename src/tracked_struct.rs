@@ -268,6 +268,8 @@ pub struct IdentityHash {
 #[derive(Default, Debug)]
 pub(crate) struct IdentityMap {
     table: FxHashMap<Identity, TrackedEntry>,
+    /// Tracked structs created during the first execution of a frozen query.
+    deferred: Vec<(IdentityHash, Id)>,
 }
 
 impl IdentityMap {
@@ -282,6 +284,30 @@ impl IdentityMap {
     pub(crate) fn mark_all_active(&mut self, items: impl IntoIterator<Item = (Identity, Id)>) {
         for (key, id) in items {
             self.insert_entry(key, id, true);
+        }
+    }
+
+    /// Frozen queries with no prior identities only need them during cycle recovery.
+    pub(crate) fn can_defer(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    /// Keeps a fresh ID available to `specify` without indexing it for reuse.
+    pub(crate) fn defer(&mut self, key: IdentityHash, id: Id) {
+        debug_assert!(self.table.is_empty());
+        self.deferred.push((key, id));
+    }
+
+    /// Assign disambiguators in creation order if a cycle may need to reuse these IDs.
+    pub(crate) fn resolve_deferred(&mut self, map: &mut DisambiguatorMap, retain: bool) {
+        if retain {
+            for (key, id) in self.deferred.drain(..) {
+                let identity = Identity::new(key, map.disambiguate(key));
+                self.table
+                    .insert(identity, TrackedEntry { id, active: true });
+            }
+        } else {
+            self.deferred.clear();
         }
     }
 
@@ -308,6 +334,11 @@ impl IdentityMap {
 
     /// Returns `true` if the given tracked struct key was created in the current query execution.
     pub(crate) fn is_active(&self, key: DatabaseKeyIndex) -> bool {
+        if !self.deferred.is_empty() {
+            return self.deferred.iter().rev().any(|(hash, id)| {
+                *id == key.key_index() && hash.ingredient_index == key.ingredient_index()
+            });
+        }
         self.table
             .iter()
             .find(|(identity, entry)| {
@@ -348,10 +379,11 @@ impl IdentityMap {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.table.is_empty()
+        self.table.is_empty() && self.deferred.is_empty()
     }
 
     pub(crate) fn clear(&mut self) {
+        self.deferred.clear();
         self.table.clear()
     }
 }
@@ -500,6 +532,14 @@ where
             ingredient_index: self.ingredient_index,
             hash: crate::hash::hash(&C::untracked_fields(&fields)),
         };
+
+        if zalsa_local.frozen_revision().is_some()
+            && let Some(stamp) = zalsa_local.deferred_stamp()
+        {
+            let id = self.allocate(zalsa, zalsa_local, &stamp, fields);
+            zalsa_local.defer_tracked_struct_id(identity_hash, id);
+            return FromId::from_id(id);
+        }
 
         let (current_deps, identity, existing_id) =
             zalsa_local.identify_tracked_struct(identity_hash);

@@ -425,12 +425,26 @@ where
     {
         // Record the current revision as active.
         let current_revision = zalsa.current_revision();
-        if C::REVISIONS != IMMORTAL {
+        let frozen = zalsa_local.frozen_revision().is_some();
+        if C::REVISIONS != IMMORTAL && !frozen {
             self.revision_queue.record(current_revision);
         }
 
         // Hash the value before acquiring the lock.
         let hash = self.hasher.hash_one(&key);
+
+        // Only remember keys found under the lock in the final revision. These
+        // slots cannot be reclaimed, so a worker can read them without the lock.
+        // A shared hash is insufficient to identify a value.
+        let recent = frozen.then(|| zalsa_local.recent_intern(hash, self.ingredient_index));
+        if let Some(entry) = recent
+            && let Some((tag, found)) = entry.get()
+            && tag == hash
+            && found.ingredient_index() == self.ingredient_index
+            && HashEqLike::eq(self.data(zalsa, found.key_index()), &key)
+        {
+            return found.key_index();
+        }
 
         let shard_index = self.shard(hash);
         // SAFETY: `shard_index` is guaranteed to be in-bounds for `self.shards`.
@@ -446,6 +460,14 @@ where
 
             // SAFETY: We hold the lock for the shard containing the value.
             let id = unsafe { *value.lru.id.get() };
+            // Slots validated in the final revision can no longer be reclaimed. The
+            // active query already carries this revision, so there is no read to record.
+            if let Some(entry) = recent
+                && value.lru.last_interned_at.load() >= current_revision
+            {
+                entry.set(Some((hash, self.database_key_index(id))));
+                return id;
+            }
             let mut durability = value.durability.load();
             let index = self.database_key_index(id);
 
@@ -512,7 +534,7 @@ where
         }
 
         // Fill up the table for the first few revisions without attempting garbage collection.
-        if !self.revision_queue.is_primed() {
+        if frozen || !self.revision_queue.is_primed() {
             return self.intern_id_cold(key, zalsa, zalsa_local, shard, shard_index, hash);
         }
 
@@ -638,13 +660,18 @@ where
     {
         let current_revision = zalsa.current_revision();
 
-        // Record the durability of the current query on the interned value.
-        let (durability, last_interned_at) = zalsa_local
-            .active_query()
-            .map(|(_, stamp)| (stamp.durability, current_revision))
-            // If there is no active query this durability does not actually matter.
-            // `last_interned_at` needs to be `Revision::MAX`, see the `intern_access_in_different_revision` test.
-            .unwrap_or((Durability::MAX, Revision::max()));
+        // In the final revision new slots are permanent. Keep them out of the LRU and
+        // avoid consulting the active query, whose stamp already includes this revision.
+        let frozen = zalsa_local.frozen_revision().is_some();
+        let (durability, last_interned_at) = if frozen {
+            (Durability::MAX, current_revision)
+        } else {
+            zalsa_local
+                .active_query()
+                .map(|(_, stamp)| (stamp.durability, current_revision))
+                // Without an active query this slot must stay valid across revisions.
+                .unwrap_or((Durability::MAX, Revision::max()))
+        };
 
         // Converting a borrowed key can call user code. Finish before the page selects
         // a slot so that a reentrant allocation cannot select the same slot.
@@ -680,7 +707,9 @@ where
         // the query has changed without a corresponding input changing. Using `current_revision`
         // for dependencies on interned values encodes the fact that interned IDs are not stable
         // across revisions.
-        report_tracked_read_if_reusable::<C>(zalsa_local, index, current_revision, durability);
+        if !frozen {
+            report_tracked_read_if_reusable::<C>(zalsa_local, index, current_revision, durability);
+        }
 
         zalsa.event(&|| {
             Event::new(EventKind::DidInternValue {
